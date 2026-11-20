@@ -1,14 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
+import { expandTilde, sanitizeText } from '../lib/validation';
 
-const expandTilde = (p: string) => {
-  if (p.startsWith('~/')) {
-    return path.join(os.homedir(), p.slice(2));
-  }
-  return p;
-};
+const VISIBLE_SUGGESTIONS = 8;
+const SCROLLBAR_SLOTS = [0, 1, 2, 3, 4, 5, 6, 7] as const;
 
 type FileModalProps = {
   mode: 'export' | 'import';
@@ -18,13 +14,25 @@ type FileModalProps = {
   onClose: () => void;
 };
 
-export function FileModal({ mode, fileAction, onClearAction, onSave, onClose }: FileModalProps) {
-  const [dirPath, setDirPath] = useState(process.cwd() + '/');
+type DirCache = {
+  dir: string;
+  entries: string[];
+};
+
+export const FileModal = React.memo(function FileModal({
+  mode,
+  fileAction,
+  onClearAction,
+  onSave,
+  onClose,
+}: FileModalProps) {
+  const [dirPath, setDirPath] = useState(() => process.cwd() + '/');
   const [fileName, setFileName] = useState('domains.conf');
   const [focusField, setFocusField] = useState<'dir' | 'file'>('dir');
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [scrollTop, setScrollTop] = useState(0);
+  const dirCacheRef = useRef<DirCache | null>(null);
 
   useEffect(() => {
     let isActive = true;
@@ -35,7 +43,7 @@ export function FileModal({ mode, fileAction, onClearAction, onSave, onClose }: 
         let searchPrefix = expandedPath;
 
         const isAbs = path.isAbsolute(expandedPath);
-        
+
         if (isAbs) {
           if (expandedPath.endsWith('/')) {
             searchDir = expandedPath;
@@ -44,53 +52,66 @@ export function FileModal({ mode, fileAction, onClearAction, onSave, onClose }: 
             searchDir = path.dirname(expandedPath);
             searchPrefix = path.basename(expandedPath);
           }
-        } else {
-          if (expandedPath.includes('/')) {
-            const absolute = path.resolve(expandedPath);
-            if (expandedPath.endsWith('/')) {
-               searchDir = absolute;
-               searchPrefix = '';
-            } else {
-               searchDir = path.dirname(absolute);
-               searchPrefix = path.basename(absolute);
-            }
+        } else if (expandedPath.includes('/')) {
+          const absolute = path.resolve(expandedPath);
+          if (expandedPath.endsWith('/')) {
+            searchDir = absolute;
+            searchPrefix = '';
+          } else {
+            searchDir = path.dirname(absolute);
+            searchPrefix = path.basename(absolute);
           }
         }
 
-        try {
-          const stats = await fs.promises.stat(searchDir);
-          if (stats.isDirectory()) {
-            const dirents = await fs.promises.readdir(searchDir, { withFileTypes: true });
-            
+        const resolvedSearchDir = path.resolve(searchDir);
+        let processed: string[];
+
+        if (dirCacheRef.current && dirCacheRef.current.dir === resolvedSearchDir) {
+          processed = dirCacheRef.current.entries;
+        } else {
+          try {
+            const stats = await fs.promises.stat(resolvedSearchDir);
+            if (!stats.isDirectory()) {
+              if (isActive) {
+                setSuggestions([]);
+                setSelectedIndex(0);
+                setScrollTop(0);
+              }
+              return;
+            }
+            const dirents = await fs.promises.readdir(resolvedSearchDir, { withFileTypes: true });
             if (!isActive) return;
 
-            const processed = dirents
-              .filter(d => d.isDirectory())
-              .map(d => d.name + '/')
-              .sort((a, b) => a.localeCompare(b));
-            
-            let matches = processed;
-            if (searchPrefix) {
-              matches = processed.filter(f => f.toLowerCase().includes(searchPrefix.toLowerCase()));
+            processed = [];
+            for (let i = 0; i < dirents.length; i++) {
+              const d = dirents[i]!;
+              if (d.isDirectory()) {
+                processed.push(d.name + '/');
+              }
             }
-            
-            setSuggestions(matches);
-            setSelectedIndex(0);
-            setScrollTop(0);
-          } else {
+            processed.sort((a, b) => a.localeCompare(b));
+            dirCacheRef.current = { dir: resolvedSearchDir, entries: processed };
+          } catch {
             if (isActive) {
               setSuggestions([]);
               setSelectedIndex(0);
               setScrollTop(0);
             }
-          }
-        } catch {
-          if (isActive) {
-            setSuggestions([]);
-            setSelectedIndex(0);
-            setScrollTop(0);
+            return;
           }
         }
+
+        if (!isActive) return;
+
+        let matches = processed;
+        if (searchPrefix) {
+          const lowerPrefix = searchPrefix.toLowerCase();
+          matches = processed.filter((f) => f.toLowerCase().includes(lowerPrefix));
+        }
+
+        setSuggestions(matches);
+        setSelectedIndex(0);
+        setScrollTop(0);
       } catch {
         if (isActive) {
           setSuggestions([]);
@@ -99,58 +120,38 @@ export function FileModal({ mode, fileAction, onClearAction, onSave, onClose }: 
         }
       }
     })();
-    return () => { isActive = false; };
+    return () => {
+      isActive = false;
+    };
   }, [dirPath]);
 
   useEffect(() => {
     if (!fileAction) return;
 
-    if (fileAction === 'down') {
-      setSelectedIndex(s => {
-        const next = Math.min(suggestions.length - 1, s + 1);
-        setScrollTop(Math.max(0, Math.min(next - 3, suggestions.length - 8)));
-        return next;
-      });
+    if (fileAction === 'down' && suggestions.length > 0) {
+      const next = Math.min(suggestions.length - 1, selectedIndex + 1);
+      setSelectedIndex(next);
+      setScrollTop(Math.max(0, Math.min(next - 3, suggestions.length - VISIBLE_SUGGESTIONS)));
     }
     if (fileAction === 'up') {
       if (focusField === 'file') {
         setFocusField('dir');
-      } else {
-        setSelectedIndex(s => {
-          const next = Math.max(0, s - 1);
-          setScrollTop(Math.max(0, Math.min(next - 3, suggestions.length - 8)));
-          return next;
-        });
+      } else if (suggestions.length > 0) {
+        const next = Math.max(0, selectedIndex - 1);
+        setSelectedIndex(next);
+        setScrollTop(Math.max(0, Math.min(next - 3, suggestions.length - VISIBLE_SUGGESTIONS)));
       }
     }
     if (fileAction === 'tab' && suggestions.length > 0) {
       const selected = suggestions[selectedIndex];
-      
-      let dir = process.cwd();
-      if (dirPath.startsWith('~/')) {
-        dir = dirPath.endsWith('/') ? dirPath : (path.dirname(dirPath) + '/');
-      } else if (path.isAbsolute(dirPath)) {
-        dir = dirPath.endsWith('/') ? dirPath : (path.dirname(dirPath) + '/');
-      } else {
-        if (dirPath.includes('/')) {
-          dir = dirPath.endsWith('/') ? dirPath : (path.dirname(dirPath) + '/');
-        } else {
-          dir = '';
+      if (selected) {
+        let dir = '';
+        if (dirPath.startsWith('~/') || path.isAbsolute(dirPath) || dirPath.includes('/')) {
+          dir = dirPath.endsWith('/') ? dirPath : path.dirname(dirPath) + '/';
         }
+        const targetPath = dir + selected;
+        setDirPath(targetPath);
       }
-      let targetPath = dir + selected;
-      
-      if (!targetPath.endsWith('/')) {
-        try {
-          const expanded = expandTilde(targetPath);
-          const absolute = path.resolve(expanded);
-          if (fs.statSync(absolute).isDirectory()) {
-            targetPath += '/';
-          }
-        } catch (e) {}
-      }
-      
-      setDirPath(targetPath);
     }
     if (fileAction === 'left') {
       const parent = path.dirname(expandTilde(dirPath));
@@ -159,14 +160,23 @@ export function FileModal({ mode, fileAction, onClearAction, onSave, onClose }: 
     onClearAction();
   }, [fileAction, suggestions, selectedIndex, dirPath, focusField, onClearAction]);
 
-  const handleSave = () => {
-    if (dirPath.trim() && fileName.trim()) {
-      onSave(path.join(expandTilde(dirPath.trim()), fileName.trim()));
+  const handleFocusFile = useCallback(() => {
+    setFocusField('file');
+  }, []);
+
+  const handleSave = useCallback(() => {
+    const cleanDir = dirPath.trim();
+    const cleanFile = fileName.trim();
+    if (cleanDir && cleanFile && !cleanDir.includes('\0') && !cleanFile.includes('\0')) {
+      onSave(path.join(expandTilde(cleanDir), cleanFile));
     }
-  };
+  }, [dirPath, fileName, onSave]);
+
+  const maxScroll = Math.max(1, suggestions.length - VISIBLE_SUGGESTIONS);
+  const thumbPosition = Math.round((scrollTop / maxScroll) * (VISIBLE_SUGGESTIONS - 1));
 
   return (
-    <box 
+    <box
       title={mode === 'export' ? 'Export Configuration' : 'Import Configuration'}
       position="absolute"
       top="25%"
@@ -184,34 +194,34 @@ export function FileModal({ mode, fileAction, onClearAction, onSave, onClose }: 
         <box flexDirection="row" marginTop={1}>
           <box width={14}><text>Directory:</text></box>
           <box flexGrow={1}>
-            <input 
-              value={dirPath} 
-              onInput={(e) => setDirPath(e)}
-              onChange={(e) => setDirPath(e)}
+            <input
+              value={dirPath}
+              onInput={setDirPath}
+              onChange={setDirPath}
               placeholder="/etc/"
               focused={focusField === 'dir'}
-              onSubmit={() => setFocusField('file')}
+              onSubmit={handleFocusFile}
             />
           </box>
         </box>
         {focusField === 'dir' && (
           <box flexDirection="row" marginTop={1} height={10} border={true} borderStyle="single">
             <box flexDirection="column" flexGrow={1} overflow="hidden">
-              {suggestions.slice(scrollTop, scrollTop + 8).map((s, i) => {
+              {suggestions.slice(scrollTop, scrollTop + VISIBLE_SUGGESTIONS).map((s, i) => {
                 const actualIndex = i + scrollTop;
                 return (
-                  <text key={actualIndex}>{actualIndex === selectedIndex ? '> ' : '  '}{s}</text>
+                  <text key={actualIndex}>
+                    {actualIndex === selectedIndex ? '> ' : '  '}{sanitizeText(s)}
+                  </text>
                 );
               })}
               {suggestions.length === 0 && <text>  (No matches)</text>}
             </box>
-            {suggestions.length > 8 && (
+            {suggestions.length > VISIBLE_SUGGESTIONS && (
               <box flexDirection="column" width={1}>
-                {Array.from({ length: 8 }).map((_, i) => {
-                  const maxScroll = Math.max(1, suggestions.length - 8);
-                  const thumbPosition = Math.round((scrollTop / maxScroll) * 7);
-                  return <text key={i}>{i === thumbPosition ? '█' : '│'}</text>;
-                })}
+                {SCROLLBAR_SLOTS.map((slot) => (
+                  <text key={slot}>{slot === thumbPosition ? '█' : '│'}</text>
+                ))}
               </box>
             )}
           </box>
@@ -220,10 +230,10 @@ export function FileModal({ mode, fileAction, onClearAction, onSave, onClose }: 
         <box flexDirection="row" marginTop={1}>
           <box width={14}><text>File Name:</text></box>
           <box flexGrow={1}>
-            <input 
-              value={fileName} 
-              onInput={(e) => setFileName(e)}
-              onChange={(e) => setFileName(e)}
+            <input
+              value={fileName}
+              onInput={setFileName}
+              onChange={setFileName}
               placeholder="domains.conf"
               focused={focusField === 'file'}
               onSubmit={handleSave}
@@ -231,11 +241,11 @@ export function FileModal({ mode, fileAction, onClearAction, onSave, onClose }: 
           </box>
         </box>
       </box>
-      
+
       <box flexGrow={1} />
       <box border={['top']} borderStyle="single" paddingY={0}>
         <text>Up/Down: Select | Tab/Right: Open | Enter: {mode === 'export' ? 'Export' : 'Import'} | Esc: Cancel</text>
       </box>
     </box>
   );
-}
+});

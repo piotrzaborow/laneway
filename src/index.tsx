@@ -1,218 +1,278 @@
 import { createCliRenderer } from "@opentui/core";
 import { createRoot } from "@opentui/react";
-import React, { useState, useEffect } from 'react';
-import { loadSystemHosts, saveSystemHosts } from './lib/hosts';
-import type { HostLine } from './lib/hosts';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import * as path from 'path';
-import * as os from 'os';
+import { loadSystemHosts, nextHostLineId, saveSystemHosts } from './lib/hosts';
+import type { HostLine } from './lib/hosts';
 import { flushDns } from './lib/dns';
 import { exportToConf, importFromConf } from './lib/config';
-
-
-const expandTilde = (p: string) => {
-  if (p.startsWith('~/')) {
-    return path.join(os.homedir(), p.slice(2));
-  }
-  return p;
-};
+import { expandTilde, parseDomainList, sanitizeText, validateHostEntry } from './lib/validation';
 import { DomainList } from './components/DomainList';
 import { DomainInfo } from './components/DomainInfo';
 import { DomainForm } from './components/DomainForm';
 import { FileModal } from './components/FileModal';
 import { TopNav } from './components/TopNav';
 
-function App() {
+type AppProps = {
+  onExit: () => void;
+};
+
+function App({ onExit }: AppProps) {
   const [lines, setLines] = useState<HostLine[]>([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [modalState, setModalState] = useState<'none' | 'add' | 'edit' | 'export' | 'import'>('none');
   const [formFocus, setFormFocus] = useState<'ip' | 'domain'>('ip');
   const [fileAction, setFileAction] = useState<'up' | 'down' | 'tab' | 'left' | null>(null);
   const [statusMessage, setStatusMessage] = useState<string>('Ready');
-
+  const isSavingRef = useRef(false);
 
   useEffect(() => {
     const loaded = loadSystemHosts();
-    
+
     // Check for --import-config flag
     const args = process.argv;
     const importIndex = args.indexOf('--import-config');
+    const importArg = importIndex !== -1 ? args[importIndex + 1] : undefined;
     let imported: HostLine[] = [];
-    
-    if (importIndex !== -1 && args[importIndex + 1]) {
-      const filePath = args[importIndex + 1];
-      const absolutePath = path.resolve(expandTilde(filePath));
+
+    if (importArg && !importArg.startsWith('--')) {
+      const absolutePath = path.resolve(expandTilde(importArg));
       const parsedImport = importFromConf(absolutePath);
       if (parsedImport.length > 0) {
-        imported = parsedImport.map(l => ({ ...l, isDirty: true }));
+        imported = parsedImport.map((l) => ({ ...l, isDirty: true }));
       }
     }
-    
+
     if (imported.length > 0) {
       setLines([...loaded, ...imported]);
       setStatusMessage('Unsaved (Imported Configuration)');
     } else {
       setLines(loaded);
+      if (importArg) {
+        setStatusMessage(`Failed to import from ${sanitizeText(importArg)}`);
+      }
     }
   }, []);
 
-  const entryLines = React.useMemo(() => lines.filter((l: HostLine) => l.type === 'entry'), [lines]);
+  const entryLines = useMemo(
+    () => lines.filter((l: HostLine) => l.type === 'entry'),
+    [lines]
+  );
   const selectedEntry = entryLines[selectedIndex];
 
-  const handleSaveDomain = (ip: string, domain: string) => {
-    if (modalState === 'add') {
-      const newEntry: HostLine = {
-        id: `entry-${crypto.randomUUID()}`,
-        type: 'entry',
-        raw: `${ip}\t${domain}`,
-        ip,
-        domains: [domain],
-        isDirty: true,
-      };
-      setLines([...lines, newEntry]);
-      // Select the newly added entry
-      const newEntryLines = [...lines, newEntry].filter((l) => l.type === 'entry');
-      setSelectedIndex(newEntryLines.length - 1);
-    } else if (modalState === 'edit' && selectedEntry) {
-      setLines(lines.map((l) => {
-        if (l.id === selectedEntry.id) {
-          return {
-            ...l,
-            ip,
-            domains: [domain],
-            raw: `${ip}\t${domain}`,
-            isDirty: true,
-          };
-        }
-        return l;
-      }));
-    }
+  const handleCloseModal = useCallback(() => {
     setModalState('none');
-    setStatusMessage('Unsaved');
-  };
+  }, []);
 
-  const handleRemoveSelected = () => {
+  const handleClearAction = useCallback(() => {
+    setFileAction(null);
+  }, []);
+
+  const handleSaveDomain = useCallback(
+    (ip: string, domain: string) => {
+      const trimmedIp = ip.trim();
+      const parsedDomains = parseDomainList(domain);
+      const validation = validateHostEntry(trimmedIp, parsedDomains);
+      if (!validation.valid) {
+        setStatusMessage(`Error: ${validation.error || 'Invalid entry'}`);
+        return;
+      }
+
+      const domainsJoined = parsedDomains.join(' ');
+
+      if (modalState === 'add') {
+        const newEntry: HostLine = {
+          id: nextHostLineId('entry'),
+          type: 'entry',
+          raw: `${trimmedIp}\t${domainsJoined}`,
+          ip: trimmedIp,
+          domains: parsedDomains,
+          isDirty: true,
+        };
+        setLines((prev) => [...prev, newEntry]);
+        // Select the newly added entry in O(1)
+        setSelectedIndex(entryLines.length);
+      } else if (modalState === 'edit' && selectedEntry) {
+        const targetId = selectedEntry.id;
+        setLines((prev) =>
+          prev.map((l) => {
+            if (l.id === targetId) {
+              const commentSuffix = l.comment ? ` ${l.comment}` : '';
+              return {
+                ...l,
+                ip: trimmedIp,
+                domains: parsedDomains,
+                raw: `${trimmedIp}\t${domainsJoined}${commentSuffix}`,
+                isDirty: true,
+              };
+            }
+            return l;
+          })
+        );
+      }
+      setModalState('none');
+      setStatusMessage('Unsaved');
+    },
+    [modalState, entryLines.length, selectedEntry]
+  );
+
+  const handleRemoveSelected = useCallback(() => {
     if (entryLines.length > 0 && selectedIndex >= 0 && selectedIndex < entryLines.length) {
       const toRemove = entryLines[selectedIndex];
       if (toRemove) {
-        setLines(lines.filter((l: HostLine) => l.id !== toRemove.id));
+        const removeId = toRemove.id;
+        setLines((prev) => prev.filter((l: HostLine) => l.id !== removeId));
         if (selectedIndex >= entryLines.length - 1 && selectedIndex > 0) {
           setSelectedIndex(selectedIndex - 1);
         }
         setStatusMessage('Unsaved');
       }
     }
-  };
+  }, [entryLines, selectedIndex]);
 
-  const handleSaveToHosts = async () => {
-    if (saveSystemHosts(lines)) {
-      // Clear dirty flags
-      setLines(lines.map(l => ({ ...l, isDirty: false })));
-      setStatusMessage('Saved');
+  const handleSaveToHosts = useCallback(async () => {
+    if (isSavingRef.current) return;
+    isSavingRef.current = true;
+    try {
+      const snapshot = lines;
+      if (saveSystemHosts(snapshot)) {
+        const savedById = new Map<string, HostLine>();
+        for (let i = 0; i < snapshot.length; i++) {
+          const item = snapshot[i]!;
+          savedById.set(item.id, item);
+        }
+        // Only clear dirty flags on entries that have not been modified again since the save snapshot
+        setLines((prev) =>
+          prev.map((l) => (savedById.get(l.id) === l ? { ...l, isDirty: false } : l))
+        );
+        setStatusMessage('Saved');
 
-      const flushed = await flushDns();
-      if (flushed) {
-        setStatusMessage('Ready');
+        const flushed = await flushDns();
+        if (flushed) {
+          setStatusMessage('Ready');
+        } else {
+          setStatusMessage('Ready (DNS Flush Failed)');
+        }
       } else {
-        setStatusMessage('Ready (DNS Flush Failed)');
+        setStatusMessage('Save Failed');
       }
-    } else {
-      setStatusMessage('Save Failed');
+    } finally {
+      isSavingRef.current = false;
     }
-  };
+  }, [lines]);
 
-  const handleExportConf = (filePath: string) => {
-    const absolutePath = path.resolve(expandTilde(filePath));
-    if (exportToConf(lines, absolutePath)) {
-      setStatusMessage(`Exported to ${absolutePath}`);
-    } else {
-      setStatusMessage(`Failed to export to ${absolutePath}`);
-    }
-    setModalState('none');
-  };
+  const handleExportConf = useCallback(
+    (filePath: string) => {
+      const absolutePath = path.resolve(expandTilde(filePath));
+      if (exportToConf(lines, absolutePath)) {
+        setStatusMessage(`Exported to ${sanitizeText(absolutePath)}`);
+      } else {
+        setStatusMessage(`Failed to export to ${sanitizeText(absolutePath)}`);
+      }
+      setModalState('none');
+    },
+    [lines]
+  );
 
-  const handleImportConf = (filePath: string) => {
+  const handleImportConf = useCallback((filePath: string) => {
     const absolutePath = path.resolve(expandTilde(filePath));
     const imported = importFromConf(absolutePath);
     if (imported.length > 0) {
       // Mark imported entries as dirty since they are not in /etc/hosts yet
-      const dirtyImported = imported.map(l => ({ ...l, isDirty: true }));
-      setLines([...lines, ...dirtyImported]);
+      const dirtyImported = imported.map((l) => ({ ...l, isDirty: true }));
+      setLines((prev) => [...prev, ...dirtyImported]);
       setStatusMessage('Unsaved');
     } else {
-      setStatusMessage(`Failed to import from ${absolutePath}`);
+      setStatusMessage(`Failed to import from ${sanitizeText(absolutePath)}`);
     }
     setModalState('none');
+  }, []);
+
+  // Keep latest state and callbacks in a ref so the raw stdin listener mounts only once
+  const keyContextRef = useRef({
+    modalState,
+    selectedIndex,
+    entryCount: entryLines.length,
+    hasSelectedEntry: Boolean(selectedEntry),
+    handleRemoveSelected,
+    handleSaveToHosts,
+    onExit,
+  });
+  keyContextRef.current = {
+    modalState,
+    selectedIndex,
+    entryCount: entryLines.length,
+    hasSelectedEntry: Boolean(selectedEntry),
+    handleRemoveSelected,
+    handleSaveToHosts,
+    onExit,
   };
 
-
-
   useEffect(() => {
-    const handleGlobalKey = (key: any) => {
+    const handleGlobalKey = (name: string) => {
+      const ctx = keyContextRef.current;
+
       // If modal is open, let modal components handle specific logic or handle Esc here.
-      if (modalState !== 'none') {
-        if (key.name === 'escape') {
+      if (ctx.modalState !== 'none') {
+        if (name === 'escape') {
           setModalState('none');
         }
-        if (modalState === 'add' || modalState === 'edit') {
-          if (key.name === 'up' || key.name === 'down') {
-            setFormFocus(prev => prev === 'ip' ? 'domain' : 'ip');
+        if (ctx.modalState === 'add' || ctx.modalState === 'edit') {
+          if (name === 'up' || name === 'down') {
+            setFormFocus((prev) => (prev === 'ip' ? 'domain' : 'ip'));
           }
         }
-        if (modalState === 'export' || modalState === 'import') {
-          if (key.name === 'up') setFileAction('up');
-          if (key.name === 'down') setFileAction('down');
-          if (key.name === 'tab' || key.name === 'right') setFileAction('tab');
-          if (key.name === 'left') setFileAction('left');
+        if (ctx.modalState === 'export' || ctx.modalState === 'import') {
+          if (name === 'up') setFileAction('up');
+          if (name === 'down') setFileAction('down');
+          if (name === 'tab' || name === 'right') setFileAction('tab');
+          if (name === 'left') setFileAction('left');
         }
         return;
       }
 
       // Main view shortcuts
-      if (key.name === 'up' && selectedIndex > 0) {
-        setSelectedIndex(selectedIndex - 1);
+      if (name === 'up' && ctx.selectedIndex > 0) {
+        setSelectedIndex(ctx.selectedIndex - 1);
       }
-      if (key.name === 'down') {
-        if (selectedIndex < entryLines.length - 1) {
-          setSelectedIndex(selectedIndex + 1);
-        }
+      if (name === 'down' && ctx.selectedIndex < ctx.entryCount - 1) {
+        setSelectedIndex(ctx.selectedIndex + 1);
       }
 
       // Actions
-      if (key.name === 'a') {
+      if (name === 'a') {
         setModalState('add');
         setFormFocus('ip');
       }
-      if (key.name === 'e' && selectedEntry) {
+      if (name === 'e' && ctx.hasSelectedEntry) {
         setModalState('edit');
         setFormFocus('ip');
       }
-      if (key.name === 'd' || key.name === 'delete' || key.name === 'backspace') handleRemoveSelected();
-      if (key.name === 's') handleSaveToHosts();
-      if (key.name === 'x') setModalState('export');
-      if (key.name === 'i') setModalState('import');
+      if (name === 'd' || name === 'delete' || name === 'backspace') ctx.handleRemoveSelected();
+      if (name === 's') ctx.handleSaveToHosts();
+      if (name === 'x') setModalState('export');
+      if (name === 'i') setModalState('import');
 
-      if (key.name === 'q') process.exit(0);
+      if (name === 'q') ctx.onExit();
     };
 
-    // Note: We need a way to listen to raw global key events in OpenTUI.
-    // Assuming process.stdin is accessible for a quick raw listener if OpenTUI doesn't export global hooks easily.
-    // Standard react-based TUI might do:
     const onData = (data: Buffer) => {
       const str = data.toString();
-      // simplified key mapping
-      let name = str.toLowerCase();
-      if (str === '\u001b[A') name = 'up';
-      if (str === '\u001b[B') name = 'down';
-      if (str === '\u001b[C') name = 'right';
-      if (str === '\u001b[D') name = 'left';
-      if (str === '\u001b') name = 'escape';
-      if (str === '\u007f' || str === '\b') name = 'backspace';
-
       if (str === '\u0003') {
-        process.exit(0); // Handle Ctrl+C globally
+        keyContextRef.current.onExit();
+        return;
       }
 
-      handleGlobalKey({ name });
+      let name = str.toLowerCase();
+      if (str === '\u001b[A') name = 'up';
+      else if (str === '\u001b[B') name = 'down';
+      else if (str === '\u001b[C') name = 'right';
+      else if (str === '\u001b[D') name = 'left';
+      else if (str === '\u001b') name = 'escape';
+      else if (str === '\u007f' || str === '\b') name = 'backspace';
+      else if (str === '\t') name = 'tab';
+
+      handleGlobalKey(name);
     };
 
     const shouldListen = process.stdin.isTTY || process.env.LANEWAY_TEST_MODE;
@@ -227,9 +287,16 @@ function App() {
     return () => {
       if (shouldListen) {
         process.stdin.removeListener('data', onData);
+        if (typeof process.stdin.setRawMode === 'function') {
+          try {
+            process.stdin.setRawMode(false);
+          } catch {
+            // ignore if TTY already closed
+          }
+        }
       }
     };
-  }, [selectedIndex, lines, modalState, entryLines, selectedEntry]);
+  }, []);
 
   let statusBarColor = 'gray';
   const lowerStatus = statusMessage.toLowerCase();
@@ -245,7 +312,7 @@ function App() {
 
       <box flexGrow={1} flexDirection="row">
         <DomainList
-          entries={lines}
+          entries={entryLines}
           selectedIndex={selectedIndex}
         />
 
@@ -254,7 +321,7 @@ function App() {
             initialData={modalState === 'edit' ? selectedEntry : undefined}
             focusField={formFocus}
             onSave={handleSaveDomain}
-            onCancel={() => setModalState('none')}
+            onCancel={handleCloseModal}
             onFocusChange={setFormFocus}
           />
         ) : (
@@ -264,16 +331,15 @@ function App() {
 
       {(modalState === 'export' || modalState === 'import') && (
         <FileModal
-          mode={modalState as 'export' | 'import'}
+          mode={modalState}
           fileAction={fileAction}
-          onClearAction={() => setFileAction(null)}
+          onClearAction={handleClearAction}
           onSave={modalState === 'export' ? handleExportConf : handleImportConf}
-          onClose={() => setModalState('none')}
+          onClose={handleCloseModal}
         />
       )}
       <box width="100%" backgroundColor={statusBarColor as any} paddingX={1} justifyContent="space-between">
         <text>Status: {statusMessage}</text>
-
       </box>
     </box>
   );
@@ -281,5 +347,20 @@ function App() {
 
 (async () => {
   const renderer = await createCliRenderer();
-  createRoot(renderer).render(<App />);
+  const handleExit = () => {
+    try {
+      if (process.stdin.isTTY && typeof process.stdin.setRawMode === 'function') {
+        process.stdin.setRawMode(false);
+      }
+    } catch {
+      // ignore terminal restore errors during exit
+    }
+    try {
+      (renderer as any)?.destroy?.();
+    } catch {
+      // ignore renderer cleanup errors
+    }
+    process.exit(0);
+  };
+  createRoot(renderer).render(<App onExit={handleExit} />);
 })();

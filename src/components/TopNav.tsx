@@ -1,6 +1,6 @@
 import React from 'react';
 
-export function TopNav() {
+export const TopNav = React.memo(function TopNav() {
   return (
     <box flexDirection="row" width="100%" paddingX={1} backgroundColor="gray" paddingY={1}>
       <text>Laneway Domain Manager</text>
@@ -10,4 +10,4 @@ export function TopNav() {
       </text>
     </box>
   );
-}
+});
